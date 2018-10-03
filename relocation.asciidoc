@@ -1,0 +1,277 @@
+Relocation
+----------
+
+=== Summary
+
+Btrfs uses a number of techniques internally to manage the storage
+associated with a volume.  At the lowest level is the xref:chunk[chunk].
+In typical deployments, the chunks contain either data extents or
+metadata tree blocks.  Mixed chunks are possible but are really only
+common on small file systems.  As the file system ages or the workload
+changes, the file system may have chunks of one type that are under-
+populated and can inhibit the file system from allocating space for
+chunks of the other.  The `btrfs balance` command is used to direct
+the file system to redistribute the space used, potentially freeing
+up block groups for re-use.  The relocation subsystem in btrfs is
+responsible for moving the blocks to a new location on disk and
+ensuring consistency during the operation.
+
+Since btrfs is, at its core, a copy-on-write file system, much of those
+mechanisms can be used to do the relocation.  That re-use also means that
+while a source block group can be targetted for relocation, the
+destination(s) for the contents is not targetable.  There are no
+constraints that ensure that all of the contents of a block group
+undergoing relocation end up in a single target block group.  Moreover,
+while we attempt to relocate data extents that are contiguous on disk
+to a new contiguous location, the logical file offset of those data
+extents is not taken into account.  This means that relocation may
+ultimately introduce file data fragmentation.  Files used by performance-
+sensitive applications may benefit from being defragmented separately
+after relocation has completed.
+
+=== Infrastructure and Mechanisms
+
+Relocation is a complex subsystem that consists of multiple interacting
+components and processes.  This section defines and explains some of
+the components involved.
+
+==== Backref cache
+
+The backref cache records useful metadata associated with each tree block
+in the block group undergoing relocation.  The backref cache nodes
+are indexed by bytenr in the backref cache tree.  Each node is also
+connected to its parents and children via two lists of edges.  The
+edges point to both parent and child and are linked to parent and
+child.  This allows each node to be quickly referenced but also allows
+quick traversal of the cached tree.  The backref cache is updated
+as the tree on disk is modified.  Also associated with each backref
+cache node is its primary owner, a potential new bytenr if the block
+has been relocated, the level in the source tree where the block is
+located, the extent buffer for the block on disk that the backref node
+represents, and several housekeeping bits.  Nodes that represent
+a tree root also point to the root it represents.
+
+The backref cache is used for caching important bits of the metadata
+tree but also to ensure that tree blocks that are owned by multiple
+roots are only relocated for the first root processed and subsequent
+roots update the blocks with the new parent node locations.  Without
+this behavior, relocation would have to use a separate CoW mechanism
+or would end up splitting apart the shared trees.  We weould then need
+an additional costly step to reconstruct the shared ownership efficiently.
+
+==== Processed blocks tracking
+
+The state associated with an a running relocation contains an `extent_io_tree`
+that is used to track which tree blocks have already been processed.  This
+may seem redundant as we iterate over the tree blocks in ascending byte order
+but we also must resolve the parent blocks for each processed block, which
+may be in, essentially, random order.
+
+==== Relocation trees
+
+The `DATA_RELOC_TREE` tree is created by `mkfs.btrfs` and is never removed.  It
+is empty except for when relocation is underway.  At the start of relocation,
+an unlinked inode is created within the `DATA_RELOC_TREE.`  A populated
+relocation inode contains the contents of each data extent being relocated,
+where the logical location within the file matches the logical location on
+disk.  As tree blocks that reference each extent are updated to point to
+the new location, references to the data extents will be added.  Since it
+is an unlinked inode, if the system crashes while relocation is underway,
+the orphan inode will be cleaned up the next time the system is mounted.
+Extents without additional references will be automatically released.
+
+*NOTE*: Relocation does not take file ownership into account, which
+implies that relocating data may affect how fragmented a file is.  Files
+used in performance-sensitive workloads may need further defragmentation
+after relocation has completed.
+
+The `TREE_RELOC` tree contains tree reloc root items.  These are the
+roots of what are, essentially, a special type of snapshot.  When
+relocation is underway, any root recorded in a transaction will have a
+`TREE_RELOC` tree created for it.  In order to minimize the runtime
+impact of relocation, the snapshot is not created at transaction commit
+time.  Rather, it is created as a snapshot of the commit root of the
+source tree.  This means that the snapshot may be taken at any time
+during the transaction cycle, but that there may be portions of the
+tree that must be revisited before relocation can be completed.
+
+==== Pending nodes
+A block that is allocated in a tree reloc tree via btrfs_cow_block while
+relocation is underway will have a backref node associated with it.  Before
+it's linked to the on-disk tree, it is marked as pending.  Pending means that
+it can be dropped in the node is being replaced.  Otherwise the blocks
+must be processed before relocation is completed, at each tree level from
+the leaf up.
+
+=== Implementation
+
+This section describes the processes used to relocate a block group.  Each
+subsection contains a description of the process followed by a technical
+workflow.  The full workflow may cycle through multiple processes for
+any given block to be relocated.
+
+==== Preparation
+
+Before we can relocate a block group, it must be marked read-only.  This
+ensures that no new allocations can occur within the block group.  The
+file system is still active during relocation.  Any modifications to
+the file system that involve changing trees or data located within the
+block group undergoing relocation will be performed using new blocks
+allocated in a different block group.  Depending on what stage the
+running transaction is executing, setting the block group read-only
+may involve waiting for the transaction to commit.
+
+.Workflow: Prepare to relocate
+************************************************
+- Set the block group read-only to ensure no new allocations within the
+  block group will be made while relocation is underway.
+
+- Create the data relocation inode.
+
+- Wait for any outstanding writes to the block group to complete.
+
+- Set up for relocation.
+  - Set the fs-global reloc control state
+  - Enable creating tree reloc trees when joining a transaction
+************************************************
+
+==== Start relocation
+Relocation can occur in up to two stages across many transactions.  The
+first stage (`MOVE_DATA_EXTENTS`) relocates tree blocks and copies, but
+doesn't yet use,
+data extents.  The second stage (`UPDATE_DATA_PTRS`) only occurs if data extents were copied
+during the first stage an dinvolves updating any tree blocks that
+reference the data extents.
+
+.Workflow: Collect candidate extents
+************************************************
+- Iterate over extents located within the block group in ascending
+order.  For each extent found:
+* Check the processed block tree.
+** If already processed: use the processed block tracking to locate the next unprocessed extent and restart the search at that location.
+* If a tree block is encountered, track it in a temporary blocks rbtree
+indexed by bytenr.
+** NOTE/BUG: In a mixed block group, I think we relocated the tree blocks twice. -jeffm
+* If a data extent is encountered:
+** If doing `MOVE_DATA_EXTENTS`:
+*** Attempt to build contiguous file extent clusters.  When we've added
+the maximum number of extents to the cluster (currently `128`) or the
+next range is discontiguous, proceeed to the
+xref:data_relocation[copying stage] .
+************************************************
+
+===== Tree relocation
+
+Tree block relocation is more complicated than relocating data extents.
+While data extents may be shared by multiple roots, the data extent
+is outside the metadata tree.  Tree blocks, even leaf blocks, can be shared
+by multiple roots.  Any parents will need to be updated to point to the new
+node.  The normal CoW mechanism does this properly when we expect that
+the resultant path will only have a single reference.  Using
+`btrfs_search_slot` with the `cow=1` parameter does the copying and
+updates the parent nodes and backrefs properly.  For non-refcounted
+roots, like the `EXTENT_TREE` or `CSUM_TREE`, that's all that's needed.
+The path is CoW'd and no further updates are required.  For refcounted
+trees, applying that same approach would successfully relocate every
+tree block from the block group, but it would also mean that none
+of the tree blocks would be shared when relocation completed.  Instead,
+we use the `btrfs_search_slot` approach on the first root, and then
+use the backref cache node's list of parents to reassociate the new
+node with each one.  Since each of those nodes _also_ needs to be
+CoW'd before we modify it, we ensure that they are only CoW'd once
+and update the same node during each subsequent iteration.
+
+[[relocate_tree_block]]
+.Workflow: Relocate one tree block
+************************************************
+
+To relocate one tree block:
+
+
+- Find the root that owns it.
+* If the root is not refcounted, use that.
+* If the root is refcounted and the node is the root node, use that.
+* If the root is refcounted but the node is not the root node, return NULL.
+* If the root is a tree reloc root, walk back down the backref tree and attempt
+  to find another root.  If there are none, return NULL.
+
+- If we have a root:
+* If we have a refcounted root, record the root to create a new reloc tree
+  if one doesn't already exist, and update the backref node to use it.  If
+  it was created, it will be marked pending for further processing.
+* If it's not a refcounted root, use `btrfs_search_slot` with `cow=1` to
+  CoW the tree out of the block group.  No further changes are required.
+* Mark the node processed, which will include all parent nodes.
+- If no root was provided, we're in the middle of a refcounted tree and
+  need to use `do_relocation`.
+
+************************************************
+
+.Workflow: Relocate a single extent, `MOVE_DATA_EXTENTS` stage
+************************************************
+
+- If the extent is a tree block, save entry to `blocks` rbtree.
+
+- For each entry in temporary blocks rbtree:
+
+* Initiate readahead on tree block
+
+- For each entry in temporary blocks rbtree:
+
+* Read the block and save the first key into the corresponding rbtree entry
+
+- For each entry in temporary blocks rbtree:
+
+* Build the backref tree for the block.  Upon completion, all paths to root blocks will be cached.
+* xref:relocate_tree_block[Relocate one tree block]
+
+- xref:relocate_data_extent[Relocate the data extent]
+
+************************************************
+
+[[data_relocation]]
+===== Data: Copying stage
+Once we have accumulated enough extents or are about to add a new extent
+that is discontigous with the last extent, we copy the entire cluster
+into the data relocation inode.  The copying leverages the data CoW
+functionality already within btrfs.  Rather than reading and writing
+explicitly, we set up a 1:1 extent mapping between the cluster range
+in the inode and the range on disk.  Then we read all of the extents
+into the page cache, preallocate space for them, and mark them for
+delalloc writeback.  When the writeback occurs, the preallocated space
+will be used.
+
+This will allow the normal writeback mechanisms to write the file data
+back into the data reloc inode as contiguously as possible in the background,
+subject to throttling.  We don't need to flush or wait for each cluster.
+
+.Workflow: Relocate one data extent
+************************************************
+
+- Preallocate the entire size of the the cluster.  If space is not
+available, we fail to relocate the entire cluster.  Ultimately, this will
+cause the entire relocation operation to fail.
+
+- Setup an extent mapping that 1:1 maps the cluster range on disk to the
+cluster range in the inode.
+
+- Iterate over each page index in the range:
+* Reserve delalloc metadata for the page
+* Find or create the page
+* Read the page if it's not already up to date
+* Lock the extent
+* Set it mapped and set the page range to EXTENT_BOUNDARY bit if necessary
+* Set the extent page range as delalloc
+* Set the page dirty
+* Unlock the extent
+* Unlock the page
+
+************************************************
+
+===== Data: Updating stage
+
+===== Notes
+The relocation implementation fully supports relocating mixed block groups.  However, in practice, most file systems will contain block groups that only
+contain `DATA` or `METADATA` extents.
+
+
